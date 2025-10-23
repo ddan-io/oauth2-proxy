@@ -28,6 +28,8 @@ type Options struct {
 	ForceHTTPS          bool     `flag:"force-https" cfg:"force_https"`
 	RawRedirectURL      string   `flag:"redirect-url" cfg:"redirect_url"`
 	RelativeRedirectURL bool     `flag:"relative-redirect-url" cfg:"relative_redirect_url"`
+	SigningKeyFile      string   `flag:"signing-key-file" cfg:"signing_key_file"`
+	StateEncryptionKey  string   `flag:"state-encryption-key" cfg:"state_encryption_key"`
 
 	AuthenticatedEmailsFile string   `flag:"authenticated-emails-file" cfg:"authenticated_emails_file"`
 	EmailDomains            []string `flag:"email-domain" cfg:"email_domains"`
@@ -161,6 +163,8 @@ func NewFlagSet() *pflag.FlagSet {
 	flagSet.Int("redis-connection-idle-timeout", 0, "Redis connection idle timeout seconds, if Redis timeout option is non-zero, the --redis-connection-idle-timeout must be less then Redis timeout option")
 	flagSet.String("signature-key", "", "GAP-Signature request signature key (algorithm:secretkey)")
 	flagSet.Bool("gcp-healthchecks", false, "Enable GCP/GKE healthcheck endpoints")
+	flagSet.String("state-encryption-key", "", "Key used to encrypt the OAuth state parameter (256bit AES base64 encoded)")
+	flagSet.String("signing-key-file", "", "Path to the file containing the payload signing key")
 
 	flagSet.AddFlagSet(cookieFlagSet())
 	flagSet.AddFlagSet(loggingFlagSet())

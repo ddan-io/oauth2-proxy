@@ -2,9 +2,14 @@ package main
 
 import (
 	"context"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rsa"
+	"crypto/x509"
 	"embed"
 	"encoding/base64"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"net"
@@ -32,6 +37,7 @@ import (
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/util"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/version"
 
+	"github.com/golang-jwt/jwt/v5"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/ip"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/logger"
 	"github.com/oauth2-proxy/oauth2-proxy/v7/pkg/middleware"
@@ -46,14 +52,15 @@ const (
 	schemeHTTPS     = "https"
 	applicationJSON = "application/json"
 
-	robotsPath        = "/robots.txt"
-	signInPath        = "/sign_in"
-	signOutPath       = "/sign_out"
-	oauthStartPath    = "/start"
-	oauthCallbackPath = "/callback"
-	authOnlyPath      = "/auth"
-	userInfoPath      = "/userinfo"
-	staticPathPrefix  = "/static/"
+	robotsPath         = "/robots.txt"
+	signInPath         = "/sign_in"
+	signOutPath        = "/sign_out"
+	oauthStartPath     = "/start"
+	oauthCallbackPath  = "/callback"
+	oauthCallbackPath2 = "/redirect"
+	authOnlyPath       = "/auth"
+	userInfoPath       = "/userinfo"
+	staticPathPrefix   = "/static/"
 )
 
 var (
@@ -114,6 +121,36 @@ type OAuthProxy struct {
 	appDirector       redirect.AppDirector
 
 	encodeState bool
+
+	StateEncryptionKey []byte
+	SigningKey         *rsa.PrivateKey
+}
+
+func LoadSigningKey(signingKeyFile string) (*rsa.PrivateKey, error) {
+	keyData, err := os.ReadFile(signingKeyFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read CA key file: %v", err)
+	}
+
+	block, _ := pem.Decode(keyData)
+	if block == nil {
+		return nil, fmt.Errorf("failed to decode PEM block containing private key")
+	}
+
+	privateKey, err := x509.ParsePKCS1PrivateKey(block.Bytes)
+	if err == nil {
+		return privateKey, nil
+	}
+	key, err := x509.ParsePKCS8PrivateKey(block.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse RSA private key: %v", err)
+	}
+	privateKey, ok := key.(*rsa.PrivateKey)
+	if !ok {
+		return nil, fmt.Errorf("failed to cast private key: %v", err)
+	}
+
+	return privateKey, nil
 }
 
 // NewOAuthProxy creates a new instance of OAuthProxy from the options provided
@@ -216,6 +253,23 @@ func NewOAuthProxy(opts *options.Options, validator func(string) bool) (*OAuthPr
 		Validator:   redirectValidator,
 	})
 
+	var stateEncryptionKey []byte = nil
+	if opts.StateEncryptionKey != "" {
+		var err error
+		stateEncryptionKey, err = base64.StdEncoding.DecodeString(opts.StateEncryptionKey)
+		if err != nil {
+			return nil, fmt.Errorf("invalid state encryption key: %v", err)
+		}
+	}
+
+	var signingKey *rsa.PrivateKey = nil
+	if opts.SigningKeyFile != "" {
+		signingKey, err = LoadSigningKey(opts.SigningKeyFile)
+		if err != nil {
+			return nil, fmt.Errorf("could not load signing key: %v", err)
+		}
+	}
+
 	p := &OAuthProxy{
 		CookieOptions: &opts.Cookie,
 		Validator:     validator,
@@ -248,6 +302,8 @@ func NewOAuthProxy(opts *options.Options, validator func(string) bool) (*OAuthPr
 		redirectValidator:  redirectValidator,
 		appDirector:        appDirector,
 		encodeState:        opts.EncodeState,
+		StateEncryptionKey: stateEncryptionKey,
+		SigningKey:         signingKey,
 	}
 	p.buildServeMux(opts.ProxyPrefix)
 
@@ -341,6 +397,7 @@ func (p *OAuthProxy) buildProxySubrouter(s *mux.Router) {
 	s.Path(signInPath).HandlerFunc(p.SignIn)
 	s.Path(oauthStartPath).HandlerFunc(p.OAuthStart)
 	s.Path(oauthCallbackPath).HandlerFunc(p.OAuthCallback)
+	s.Path(oauthCallbackPath2).HandlerFunc(p.OAuthCallback)
 
 	// Static file paths
 	s.PathPrefix(staticPathPrefix).Handler(http.StripPrefix(p.ProxyPrefix, http.FileServer(http.FS(staticFiles))))
@@ -873,27 +930,44 @@ func (p *OAuthProxy) OAuthCallback(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	nonce, appRedirect, err := decodeState(req.Form.Get("state"), p.encodeState)
-	if err != nil {
-		logger.Errorf("Error while parsing OAuth2 state: %v", err)
-		p.ErrorPage(rw, req, http.StatusInternalServerError, err.Error())
-		return
+	var nonce, appRedirect string
+	var codeVerifier string
+	var isUsingStateInfo = false
+	var csrf cookies.CSRF = nil
+	if p.StateEncryptionKey != nil {
+		statePlainText, err := decodeStateEncrypted(req.Form.Get("state"), p.StateEncryptionKey)
+		if err == nil {
+			isUsingStateInfo = true
+			stateArray := strings.Split(statePlainText, ",")
+			appRedirect = stateArray[0]
+			codeVerifier = stateArray[2]
+		}
+	}
+	if !isUsingStateInfo {
+		nonce, appRedirect, err = decodeState(req.Form.Get("state"), p.encodeState)
+		if err != nil {
+			logger.Errorf("Error while parsing OAuth2 state: %v", err)
+			p.ErrorPage(rw, req, http.StatusInternalServerError, err.Error())
+			return
+		}
+
+		// calculate the cookie name
+		cookieName := cookies.GenerateCookieName(p.CookieOptions, nonce)
+		// Try to find the CSRF cookie and decode it
+		csrf, err = cookies.LoadCSRFCookie(req, cookieName, p.CookieOptions)
+		if err != nil {
+			// There are a lot of issues opened complaining about missing CSRF cookies.
+			// Try to log the INs and OUTs of OAuthProxy, to be easier to analyse these issues.
+			LoggingCSRFCookiesInOAuthCallback(req, cookieName)
+			logger.Println(req, logger.AuthFailure, "Invalid authentication via OAuth2: unable to obtain CSRF cookie: %s (state=%s)", err, nonce)
+			p.ErrorPage(rw, req, http.StatusForbidden, err.Error(), "Login Failed: Unable to find a valid CSRF token. Please try again.")
+			return
+		}
+
+		codeVerifier = csrf.GetCodeVerifier()
 	}
 
-	// calculate the cookie name
-	cookieName := cookies.GenerateCookieName(p.CookieOptions, nonce)
-	// Try to find the CSRF cookie and decode it
-	csrf, err := cookies.LoadCSRFCookie(req, cookieName, p.CookieOptions)
-	if err != nil {
-		// There are a lot of issues opened complaining about missing CSRF cookies.
-		// Try to log the INs and OUTs of OAuthProxy, to be easier to analyse these issues.
-		LoggingCSRFCookiesInOAuthCallback(req, cookieName)
-		logger.Println(req, logger.AuthFailure, "Invalid authentication via OAuth2: unable to obtain CSRF cookie: %s (state=%s)", err, nonce)
-		p.ErrorPage(rw, req, http.StatusForbidden, err.Error(), "Login Failed: Unable to find a valid CSRF token. Please try again.")
-		return
-	}
-
-	session, err := p.redeemCode(req, csrf.GetCodeVerifier())
+	session, err := p.redeemCode(req, codeVerifier)
 	if err != nil {
 		logger.Errorf("Error redeeming code during OAuth2 callback: %v", err)
 		p.ErrorPage(rw, req, http.StatusInternalServerError, err.Error())
@@ -907,24 +981,30 @@ func (p *OAuthProxy) OAuthCallback(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	csrf.ClearCookie(rw, req)
+	if csrf != nil {
+		csrf.ClearCookie(rw, req)
 
-	if !csrf.CheckOAuthState(nonce) {
-		logger.PrintAuthf(session.Email, req, logger.AuthFailure, "Invalid authentication via OAuth2: CSRF token mismatch, potential attack")
-		p.ErrorPage(rw, req, http.StatusForbidden, "CSRF token mismatch, potential attack", "Login Failed: Unable to find a valid CSRF token. Please try again.")
-		return
-	}
+		if !csrf.CheckOAuthState(nonce) {
+			logger.PrintAuthf(session.Email, req, logger.AuthFailure, "Invalid authentication via OAuth2: CSRF token mismatch, potential attack")
+			p.ErrorPage(rw, req, http.StatusForbidden, "CSRF token mismatch, potential attack", "Login Failed: Unable to find a valid CSRF token. Please try again.")
+			return
+		}
 
-	csrf.SetSessionNonce(session)
-	if !p.provider.ValidateSession(req.Context(), session) {
-		logger.PrintAuthf(session.Email, req, logger.AuthFailure, "Session validation failed: %s", session)
-		p.ErrorPage(rw, req, http.StatusForbidden, "Session validation failed")
-		return
+		csrf.SetSessionNonce(session)
+		if !p.provider.ValidateSession(req.Context(), session) {
+			logger.PrintAuthf(session.Email, req, logger.AuthFailure, "Session validation failed: %s", session)
+			p.ErrorPage(rw, req, http.StatusForbidden, "Session validation failed")
+			return
+		}
 	}
+	// Else nonce is verified by the end target (i.e. the device)
 
-	if !p.redirectValidator.IsValidRedirect(appRedirect) {
-		appRedirect = "/"
+	if !isUsingStateInfo {
+		if !p.redirectValidator.IsValidRedirect(appRedirect) {
+			appRedirect = "/"
+		}
 	}
+	// Else no need to validate - the redirect was sent in the state info
 
 	// set cookie, or deny
 	authorized, err := p.provider.Authorize(req.Context(), session)
@@ -939,7 +1019,37 @@ func (p *OAuthProxy) OAuthCallback(rw http.ResponseWriter, req *http.Request) {
 			p.ErrorPage(rw, req, http.StatusInternalServerError, err.Error())
 			return
 		}
-		http.Redirect(rw, req, appRedirect, http.StatusFound)
+		if p.SigningKey != nil {
+			ssoJWT, err := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
+				"access_token": session.AccessToken,
+				"id_token":     session.IDToken,
+			}).SignedString(p.SigningKey)
+			if err != nil {
+				logger.Errorf("Error generating SSO JWT: %v", err)
+				p.ErrorPage(rw, req, http.StatusInternalServerError, err.Error())
+				return
+			}
+			formHTML := fmt.Sprintf(`
+        <html>
+        <body onload="document.forms[0].submit()">
+            <form action="%s" method="post">
+                <input type="hidden" name="sso_jwt" value="%s" />
+            </form>
+        </body>
+        </html>
+    `, appRedirect, ssoJWT)
+
+			rw.Header().Set("Content-Type", "text/html")
+			rw.WriteHeader(http.StatusOK)
+			_, err = rw.Write([]byte(formHTML))
+			if err != nil {
+				logger.Errorf("Error writing form HTML to response: %v", err)
+			}
+
+		} else {
+
+			http.Redirect(rw, req, appRedirect, http.StatusFound)
+		}
 	} else {
 		logger.PrintAuthf(session.Email, req, logger.AuthFailure, "Invalid authentication via OAuth2: unauthorized")
 		p.ErrorPage(rw, req, http.StatusForbidden, "Invalid session: unauthorized")
@@ -1264,6 +1374,48 @@ func decodeState(state string, encode bool) (string, string, error) {
 		return "", "", errors.New("invalid length")
 	}
 	return parsedState[0], parsedState[1], nil
+}
+
+func decodeStateEncrypted(stateEncoded string, encryptionKey []byte) (string, error) {
+	// Decode the base64-encoded state
+	state, err := base64.StdEncoding.DecodeString(stateEncoded)
+	if err != nil {
+		return "", err
+	}
+
+	// Extract the IV and the encrypted state
+	if len(state) < aes.BlockSize {
+		return "", errors.New("state is too short to contain IV and encrypted data")
+	}
+	iv := state[:aes.BlockSize]
+	encryptedState := state[aes.BlockSize:]
+
+	// Create the AES cipher
+	block, err := aes.NewCipher(encryptionKey)
+	if err != nil {
+		return "", err
+	}
+
+	// Create the CBC decrypter
+	mode := cipher.NewCBCDecrypter(block, iv)
+
+	// Decrypt the state
+	decrypted := make([]byte, len(encryptedState))
+	mode.CryptBlocks(decrypted, encryptedState)
+
+	// Remove PKCS7 padding
+	paddingLength := int(decrypted[len(decrypted)-1])
+	if paddingLength > len(decrypted) || paddingLength == 0 {
+		return "", errors.New("invalid padding")
+	}
+	for _, padByte := range decrypted[len(decrypted)-paddingLength:] {
+		if int(padByte) != paddingLength {
+			return "", errors.New("invalid padding")
+		}
+	}
+	decrypted = decrypted[:len(decrypted)-paddingLength]
+
+	return string(decrypted), nil
 }
 
 // addHeadersForProxying adds the appropriate headers the request / response for proxying
